@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+const Atomic = @import("atomic.zig").Atomic;
 const AtomicOrder = builtin.AtomicOrder;
 const AtomicRmwOp = builtin.AtomicRmwOp;
 
@@ -27,16 +29,16 @@ pub fn Deque(comptime T: type) type {
         const Self = @This();
 
         allocator: *mem.Allocator,
-        array: *Buffer(T),
-        bottom: isize,
-        top: isize,
+        array: Atomic(*Buffer(T)),
+        bottom: Atomic(isize),
+        top: Atomic(isize),
 
         pub fn new(allocator: *mem.Allocator) !Self {
             return Self {
                 .array = try Buffer.new(allocator, MIN_SIZE),
                 .allocator = allocator,
-                .bottom = 0,
-                .top = 0,
+                .bottom = Atomic.init(0),
+                .top = Atomic.init(0),
             };
         }
 
