@@ -16,16 +16,20 @@ pub fn Atomic(comptime T: type) type {
             return Self { .raw = raw };
         }
 
-        pub fn load(self: *Self, order: AtomicOrder) T {
+        pub fn load(self: *Self, comptime order: builtin.AtomicOrder) T {
             return @atomicLoad(T, &self.raw, order);
         }
 
-        pub fn store(self: *Self, new: T) void {
-            _ = self.xchg(new);
+        pub fn store(self: *Self, new: T, comptime order: builtin.AtomicOrder) void {
+            _ = self.xchg(new, order);
         }
 
-        pub fn xchg(self: *Self, new: T, order: AtomicOrder) T {
-            return @atomicRmw(T, &self.raw, AtomicRmwOp.Xchg, new, order);
+        pub fn xchg(self: *Self, new: T, comptime order: builtin.AtomicOrder) T {
+            return @atomicRmw(T, &self.raw, builtin.AtomicRmwOp.Xchg, new, order);
+        }
+
+        pub fn cmpxchgStrong(self: *Self, old: T, new: T, comptime order: builtin.AtomicOrder) ?T {
+            return @cmpxchgStrong(T, &self.raw, old, new, order, order);
         }
     };
 }

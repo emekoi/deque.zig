@@ -15,12 +15,61 @@ const mem = std.mem;
 
 const MIN_SIZE = 32;
 
-pub fn Buffer(comptime T: type) type {
+fn Buffer(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        storage: []T,
+        allocator: *mem.Allocator,
         prev: ?*Buffer(T),
+        storage: []T,
+
+        fn new(allocator: *mem.Allocator, size: usize) !*Self {
+            var self = try allocator.createOne(Self);
+            self.storage = try allocator.alloc(T, size);
+            self.allocator = allocator;
+            self.prev = null;
+
+            return self;
+        }
+
+        fn deinit(self: *Self) void {
+            var buffer: ?*Self = self;
+            while (buffer) |buf| {
+                self.allocator.free(buf.storage);
+                buffer = buf.prev;
+                self.allocator.destroy(buf);
+            }
+        }
+
+        fn count(self: *const Self) isize {
+            return @intCast(isize, self.storage.len);
+        }
+
+        fn mask(self: *const Self) usize {
+            return @intCast(usize, self.storage.len) -% 1;
+        }
+
+        fn elem(self: *const Self, i: isize) *T {
+            return &self.storage[@bitCast(usize, i) & self.mask()];
+        }
+
+        fn get(self: *const Self, i: isize) T {
+            return self.elem(i).*;
+        }
+
+        fn set(self: *const Self, i: isize, item: T) void {
+            self.elem(i).* = item;
+        }
+
+        fn grow(self: *Self, b: isize, t: isize) !*Self {
+            var buf = try Self.new(self.allocator, self.storage.len * 2);
+            var i = t;
+            while (i != b) : (i +%= 1) {
+                buf.set(i, self.get(i));
+            }
+            buf.prev = self;
+            return buf;
+        }
     };
 }
 
@@ -35,44 +84,100 @@ pub fn Deque(comptime T: type) type {
 
         pub fn new(allocator: *mem.Allocator) !Self {
             return Self {
-                .array = try Buffer.new(allocator, MIN_SIZE),
+                .array = Atomic(*Buffer(T)).init(try Buffer(T).new(allocator, MIN_SIZE)),
+                .bottom = Atomic(isize).init(0),
+                .top = Atomic(isize).init(0),
                 .allocator = allocator,
-                .bottom = Atomic.init(0),
-                .top = Atomic.init(0),
             };
         }
 
         pub fn deinit(self: *Self) void {
-
+            self.array.load(AtomicOrder.Monotonic).deinit();
         }
 
-        fn push(self: *const Self, item: T) !void {
-            const b = @atomicLoad(isize, &self.bottom, AtomicOrder.Relaxed);
-            const t = @atomicLoad(isize, &self.top, AtomicOrder.Acquire);
-            var a = @atomicLoad(*Buffer(T), &self.array, AtomicOrder.Relaxed);
+        fn push(self: *Self, item: T) !void {
+            const b = self.bottom.load(AtomicOrder.Monotonic);
+            const t = self.top.load(AtomicOrder.Acquire);
+            var a = self.array.load(AtomicOrder.Monotonic);
 
             const size = b -% t;
-            if (size == a.len) {
+            if (size == a.count()) {
                 a = try a.grow(b, t);
-                _ = @atomicRmw(*Buffer(T), &self.array, AtomicRmwOp.Xchg, a, AtomicOrder.Relaxed);
+                self.array.store(a, AtomicOrder.Release);
             }
 
-            a.put(b, item);
+            a.set(b, item);
             @fence(AtomicOrder.Release);
-            _ = @atomicRmw(isize, &self.bottom, AtomicRmwOp.Xchg, b + 1, AtomicOrder.Relaxed);
+            self.bottom.store(b + 1, AtomicOrder.Monotonic);
         }
 
-        fn pop(self: *const Self) ?T {
-            const b = @atomicLoad(isize, &self.bottom, AtomicOrder.Relaxed);
+        fn pop(self: *Self) ?T {
+            var b = self.bottom.load(AtomicOrder.Monotonic);
+            var t = self.top.load(AtomicOrder.Monotonic);
+
+            if (b -% t <= 0) {
+                return null;
+            }
+
+            b -%= 1;
+            self.bottom.store(b, AtomicOrder.Monotonic);
+            @fence(AtomicOrder.SeqCst);
+
+            t = self.top.load(AtomicOrder.Monotonic);
+
+            const size = b -% t;
+            if (size < 0) {
+                self.bottom.store(b +% 1, AtomicOrder.Monotonic);
+                return null;
+            }
+
+            const a = self.array.load(AtomicOrder.Monotonic);
+            var data = a.get(b);
+
+            if (size != 0) {
+                return data;
+            }
+
+            if (self.top.cmpxchgStrong(t, t +% 1, AtomicOrder.SeqCst)) |old| {
+                if (t == old) {
+                    self.bottom.store(t +% 1, AtomicOrder.Monotonic);
+                    return data;
+                }
+            } else {
+                self.bottom.store(t +% 1, AtomicOrder.Monotonic);
+                return null;
+            }
         }
 
-        pub fn worker(self: *const Self) Worker(T) {
+        pub fn steal(self: *Self) Stolen(T) {
+            const t = self.top.load(AtomicOrder.Acquire);
+            @fence(AtomicOrder.SeqCst);
+            const b = self.bottom.load(AtomicOrder.Acquire);
+
+            const size = b -% t;
+            if (size <= 0) {
+                return Stolen(T) { .Empty = {} };
+            }
+
+            const a = self.array.load(AtomicOrder.Acquire);
+            const data = a.get(t);
+            
+            if (self.top.cmpxchgStrong(t, t +% 1, AtomicOrder.SeqCst)) |old| {
+                if (t == old) {
+                    return Stolen(T) { .Data = data };
+                }
+            }
+
+            return Stolen(T) { .Abort = {} };
+        }
+
+        pub fn worker(self: *Self) Worker(T) {
             return Worker(T) {
                 .deque = self,
             };
         }
 
-        pub fn stealer(self: *const Self) Stealer(T) {
+        pub fn stealer(self: *Self) Stealer(T) {
             return Stealer(T) {
                 .deque = self,
             };
@@ -87,7 +192,7 @@ pub fn Worker(comptime T: type) type {
         deque: *Deque(T),
 
         pub fn push(self: *const Self, item: T) !void {
-            try self.deque.push(T);
+            try self.deque.push(item);
         }
 
         pub fn pop(self: *const Self, item: T) ?T {
@@ -114,4 +219,48 @@ pub fn Stolen(comptime T: type) type {
         Abort: void,
         Data: T,
     };
+}
+
+const AMT: usize = 100000;
+
+test "stealpush" {    
+    var direct_allocator = std.heap.DirectAllocator.init();
+    defer direct_allocator.deinit();
+
+    var plenty_of_memory = try direct_allocator.allocator.alloc(u8, 500 * 1024);
+    defer direct_allocator.allocator.free(plenty_of_memory);
+
+    var fixed_buffer_allocator = std.heap.ThreadSafeFixedBufferAllocator.init(plenty_of_memory);
+    var a = &fixed_buffer_allocator.allocator;
+
+    var deque = try Deque(isize).new(a);
+    defer deque.deinit();
+
+    const worker = deque.worker();
+    const stealer = deque.stealer();
+
+    const thread = try std.os.spawnThread(&stealer, worker_stealpush);
+
+    var i: usize = 0;
+    while (i < AMT) : (i += 1) {
+        try worker.push(1);
+    }
+
+    thread.wait();
+}
+
+fn worker_stealpush(stealer: *const Stealer(isize)) void {
+    var left = AMT;
+    while (left > 0) {
+        switch (stealer.steal()) {
+            Stolen(isize).Data => |i| {
+                std.debug.assert(i == 1);
+                std.debug.warn("{}\n", i);
+                left -= 1;
+            },
+            Stolen(isize).Abort, Stolen(isize).Empty => {
+                
+            }
+        }
+    }
 }
