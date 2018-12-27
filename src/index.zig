@@ -203,9 +203,13 @@ fn Buffer(comptime T: type) type {
         }
 
         fn deinit(self: *Self) void {
+            std.debug.warn("{}", self.storage.len);
             self.allocator.free(self.storage);
             if (self.prev) |buf| {
+                std.debug.warn(" + ");
                 buf.deinit();
+            } else {
+                std.debug.warn("\n");
             }
             self.allocator.destroy(self);
         }
@@ -242,16 +246,12 @@ fn Buffer(comptime T: type) type {
     };
 }
 
-const AMT: usize = 100000;
+const AMT: usize = 10000;
+const AMT_size: usize = AMT * 2;
+var static_memory = []u8{0} ** (@sizeOf(usize) * AMT_size);
 
 test "steal and push" {
-    var da = std.heap.DirectAllocator.init();
-    defer da.deinit();
-
-    var memory = try da.allocator.alloc(u8, @sizeOf(usize) * AMT);
-    defer da.allocator.free(memory);
-
-    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(memory);
+    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(static_memory[0..]);
     var a = &fba.allocator;
 
     var deque = try Deque(usize).new(a);
@@ -276,31 +276,21 @@ fn worker_stealpush(stealer: Stealer(usize)) void {
                 std.debug.assert(i + left == AMT);
                 left -= 1;
             },
-            Stolen(usize).Empty => {},
+            Stolen(usize).Empty => break,
             Stolen(usize).Abort => {},
         }
     }
 }
 
-
 // test "multiple threads" {
-//     var da = std.heap.DirectAllocator.init();
-//     defer da.deinit();
-//     // @compileLog((@sizeOf(usize) * AMT) * 4);
-//     var memory = try da.allocator.alloc(u8, (@sizeOf(usize) * AMT) * 1);
-//     defer da.allocator.free(memory);
-
-//     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(memory);
+//     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(static_memory[0..]);
 //     var a = &fba.allocator;
-
 //     var deque = try Deque(usize).withCapacity(a, AMT);
 //     defer deque.deinit();
-
-//     // var threads: [2]*std.os.Thread = undefined;
-//     // for (threads) |*t| {
-//     //     t.* = try std.os.spawnThread(deque.stealer(), worker_multi);
-//     // }
-    
+//     var threads: [2]*std.os.Thread = undefined;
+//     for (threads) |*t| {
+//         t.* = try std.os.spawnThread(deque.stealer(), worker_multi);
+//     }
 //     var i: usize = 0;
 //     const worker = deque.worker();
 //     while (i < AMT) : (i += 1) {
@@ -309,22 +299,21 @@ fn worker_stealpush(stealer: Stealer(usize)) void {
 //             unreachable;
 //         };
 //     }
-
-//     // for (threads) |t| {
-//     //     t.wait();
-//     // }
+//     for (threads) |t| {
+//         t.wait();
+//     }
 // }
 
 // fn worker_multi(stealer: Stealer(usize)) void {
-//     // while (true) {
-//     //     switch (stealer.steal()) {
-//     //         Stolen(usize).Data => |i| {
-//     //             // std.debug.warn("thread {}: {}\n", std.os.Thread.getCurrentId(), i);
-//     //         },
-//     //         Stolen(usize).Empty => {
-//     //             break;
-//     //         },
-//     //         Stolen(usize).Abort => {},
-//     //     }
-//     // }
+//     while (true) {
+//         switch (stealer.steal()) {
+//             Stolen(usize).Data => |i| {
+//                 // std.debug.warn("thread {}: {}\n", std.os.Thread.getCurrentId(), i);
+//             },
+//             Stolen(usize).Empty => {
+//                 break;
+//             },
+//             Stolen(usize).Abort => {},
+//         }
+//     }
 // }
