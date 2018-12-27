@@ -28,8 +28,23 @@ pub fn Atomic(comptime T: type) type {
             return @atomicRmw(T, &self.raw, builtin.AtomicRmwOp.Xchg, new, order);
         }
 
-        pub fn cmpxchgStrong(self: *Self, old: T, new: T, comptime order: builtin.AtomicOrder) ?T {
-            return @cmpxchgStrong(T, &self.raw, old, new, order, order);
+        fn strongestFailureOrder(comptime order: builtin.AtomicOrder) builtin.AtomicOrder {
+            return switch (order) {
+                builtin.AtomicOrder.Release => builtin.AtomicOrder.Monotonic,
+                builtin.AtomicOrder.Monotonic => builtin.AtomicOrder.Monotonic,
+                builtin.AtomicOrder.SeqCst => builtin.AtomicOrder.SeqCst,
+                builtin.AtomicOrder.Acquire => builtin.AtomicOrder.Acquire,
+                builtin.AtomicOrder.AcqRel => builtin.AtomicOrder.Acquire,
+                else => @panic("invalid AtomicOrder"),
+            };
+        }
+
+        pub fn cmpSwap(self: *Self, expected: T, new: T, comptime order: builtin.AtomicOrder) T {
+            if (@cmpxchgStrong(T, &self.raw, expected, new, order, comptime strongestFailureOrder(order))) |current| {
+                return current;
+            } else {
+                return expected;
+            }
         }
     };
 }
