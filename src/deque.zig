@@ -273,7 +273,7 @@ fn worker_stealpush(stealer: Stealer(usize)) void {
     while (left > 0) {
         switch (stealer.steal()) {
             Stolen(usize).Data => |i| {
-                std.debug.assert(i + left == AMT);
+                std.testing.expectEqual(i + left, AMT);
                 left -= 1;
             },
             Stolen(usize).Empty => break,
