@@ -7,9 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Atomic = @import("atomic.zig").Atomic;
-const AtomicOrder = builtin.AtomicOrder;
-const AtomicRmwOp = builtin.AtomicRmwOp;
+const Atomic = @import("deque/atomic.zig").Atomic;
 
 const mem = std.mem;
 
@@ -42,17 +40,7 @@ pub fn Deque(comptime T: type) type {
 
         pub fn new(allocator: *mem.Allocator) !Self {
             const buf = try Buffer(T).new(allocator, MIN_SIZE);
-            return Self {
-                .array = Atomic(*Buffer(T)).init(buf),
-                .bottom = Atomic(isize).init(0),
-                .top = Atomic(isize).init(0),
-                .allocator = allocator,
-            };
-        }
-
-        pub fn withCapacity(allocator: *mem.Allocator, size: usize) !Self{
-            const buf = try Buffer(T).new(allocator, nextPowerOf2(size));
-            return Self {
+            return Self{
                 .array = Atomic(*Buffer(T)).init(buf),
                 .bottom = Atomic(isize).init(0),
                 .top = Atomic(isize).init(0),
@@ -61,90 +49,90 @@ pub fn Deque(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.array.load(AtomicOrder.Monotonic).deinit();
+            self.array.load(.Monotonic).deinit();
         }
 
         pub fn worker(self: *Self) Worker(T) {
-            return Worker(T) {
+            return Worker(T){
                 .deque = self,
             };
         }
 
         pub fn stealer(self: *Self) Stealer(T) {
-            return Stealer(T) {
+            return Stealer(T){
                 .deque = self,
             };
         }
 
         fn push(self: *Self, item: T) !void {
-            const b = self.bottom.load(AtomicOrder.Monotonic);
-            const t = self.top.load(AtomicOrder.Acquire);
-            var a = self.array.load(AtomicOrder.Monotonic);
+            const bottom = self.bottom.load(.Monotonic);
+            const top = self.top.load(.Acquire);
+            var array = self.array.load(.Monotonic);
 
-            const size = b -% t;
-            if (size == a.count()) {
-                a = try a.grow(b, t);
-                self.array.store(a, AtomicOrder.Release);
+            const size = bottom -% top;
+            if (size == array.count()) {
+                array = try array.grow(bottom, top);
+                self.array.store(array, .Release);
             }
 
-            a.put(b, item);
-            @fence(AtomicOrder.Release);
-            self.bottom.store(b +% 1, AtomicOrder.Monotonic);
+            array.put(bottom, item);
+            @fence(.Release);
+            self.bottom.store(bottom +% 1, .Monotonic);
         }
 
         fn pop(self: *Self) ?T {
-            var b = self.bottom.load(AtomicOrder.Monotonic);
-            var t = self.top.load(AtomicOrder.Monotonic);
+            var bottom = self.bottom.load(.Monotonic);
+            var top = self.top.load(.Monotonic);
 
-            if (b -% t <= 0) {
+            if (bottom -% top <= 0) {
                 return null;
             }
 
-            b -%= 1;
-            self.bottom.store(b, AtomicOrder.Monotonic);
-            @fence(AtomicOrder.SeqCst);
+            bottom -%= 1;
+            self.bottom.store(bottom, .Monotonic);
+            @fence(.SeqCst);
 
-            t = self.top.load(AtomicOrder.Monotonic);
+            top = self.top.load(.Monotonic);
 
-            const size = b -% t;
+            const size = bottom -% top;
             if (size < 0) {
-                self.bottom.store(b +% 1, AtomicOrder.Monotonic);
+                self.bottom.store(bottom +% 1, .Monotonic);
                 return null;
             }
 
-            const a = self.array.load(AtomicOrder.Monotonic);
-            var data = a.get(b);
+            const a = self.array.load(.Monotonic);
+            var data = a.get(bottom);
 
             if (size != 0) {
                 return data;
             }
 
-            if (self.top.cmpSwap(t, t +% 1, AtomicOrder.SeqCst) == t) {
-                self.bottom.store(t +% 1, AtomicOrder.Monotonic);
+            if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
+                self.bottom.store(top +% 1, .Monotonic);
                 return data;
             } else {
-                self.bottom.store(t +% 1, AtomicOrder.Monotonic);
+                self.bottom.store(top +% 1, .Monotonic);
                 return null;
             }
         }
 
         pub fn steal(self: *Self) Stolen(T) {
-            const t = self.top.load(AtomicOrder.Acquire);
-            @fence(AtomicOrder.SeqCst);
-            const b = self.bottom.load(AtomicOrder.Acquire);
+            const top = self.top.load(.Acquire);
+            @fence(.SeqCst);
+            const bottom = self.bottom.load(.Acquire);
 
-            const size = b -% t;
+            const size = bottom -% top;
             if (size <= 0) {
-                return Stolen(T) { .Empty = {} };
+                return Stolen(T){ .Empty = {} };
             }
 
-            const a = self.array.load(AtomicOrder.Acquire);
-            const data = a.get(t);
-            
-            if (self.top.cmpSwap(t, t +% 1, AtomicOrder.SeqCst) == t) {
-                return Stolen(T) { .Data = data };
+            const a = self.array.load(.Acquire);
+            const data = a.get(top);
+
+            if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
+                return Stolen(T){ .Data = data };
             } else {
-                return Stolen(T) { .Abort = {} };
+                return Stolen(T){ .Abort = {} };
             }
         }
     };
@@ -234,10 +222,10 @@ fn Buffer(comptime T: type) type {
             self.elem(i).* = item;
         }
 
-        fn grow(self: *Self, b: isize, t: isize) !*Self {
+        fn grow(self: *Self, bottom: isize, top: isize) !*Self {
             var buf = try Self.new(self.allocator, self.storage.len * 2);
-            var i = t;
-            while (i != b) : (i +%= 1) {
+            var i = top;
+            while (i != bottom) : (i +%= 1) {
                 buf.put(i, self.get(i));
             }
             buf.prev = self;
