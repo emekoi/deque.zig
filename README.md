@@ -9,42 +9,58 @@ a lock free chase-lev deque for zig.
 const std = @import("std");
 const deque = @import("deque");
 
-const assert = std.debug.assert;
-const heap = std.heap;
-const os = std.os;
+const AMOUNT: usize = 100000;
 
-const AMT: usize = 100000;
-var static_memory = []u8{0} ** (@sizeOf(usize) * AMT * 2);
+const Task = struct {
+    const Self = @This();
+    stealer: deque.Stealer(usize, 32),
+    data: [AMOUNT]usize = [_]usize{0} ** AMOUNT,
+
+    fn task(self: *Self) void {
+        while (true) {
+            switch (self.stealer.steal()) {
+                Stolen(usize).Data => |i| {
+                    defer std.testing.expectEqual(i, self.data[i]);
+                    self.data[i] += i;
+                },
+                Stolen(usize).Empty => break,
+                Stolen(usize).Retry => continue,
+            }
+        }
+    }
+
+    fn verify(self: Self) void {
+        for (self.data[0..]) |*i, idx| {
+            std.testing.expectEqual(idx, i.*);
+        }
+    }
+};
 
 pub fn main() !void {
-    var fba = heap.ThreadSafeFixedBufferAllocator.init(static_memory[0..]);
-    var allocator = &fba.allocator;
+    var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
+    var alloc = &fba.allocator;
 
-    var d = try deque.Deque(usize).withCapacity(allocator, AMT);
+    var d = try deque.Deque(usize, 32).new(alloc);
     defer d.deinit();
-
-    const thread = try os.spawnThread(d.stealer(), worker);
 
     var i: usize = 0;
     const worker = d.worker();
-    while (i < AMT) : (i += 1) {
+    while (i < AMOUNT) : (i += 1) {
         try worker.push(i);
     }
 
-    thread.wait();
-}
+    var threads: [4]*std.Thread = undefined;
+    var task = Task{
+        .stealer = d.stealer(),
+    };
 
-fn worker(stealer: deque.Stealer(usize)) void {
-    var left: usize = AMT;
-    while (left > 0) {
-        switch (stealer.steal()) {
-            deque.Stolen(usize).Data => |i| {
-                std.debug.assert(i + left == AMT);
-                left -= 1;
-            },
-            deque.Stolen(usize).Empty => break,
-            deque.Stolen(usize).Abort => {},
-        }
-    }
+    for (threads) |*thread|
+        thread.* = try Thread.spawn(&task, Task.task);
+
+    for (threads) |thread|
+        thread.wait();
+
+    task.verify();
 }
 ```
