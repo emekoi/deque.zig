@@ -17,15 +17,9 @@ const Task = struct {
     data: [AMOUNT]usize = [_]usize{0} ** AMOUNT,
 
     fn task(self: *Self) void {
-        while (true) {
-            switch (self.stealer.steal()) {
-                Stolen(usize).Data => |i| {
-                    defer std.testing.expectEqual(i, self.data[i]);
-                    self.data[i] += i;
-                },
-                Stolen(usize).Empty => break,
-                Stolen(usize).Retry => continue,
-            }
+        while (self.stealer.steal()) |i| {
+            defer std.testing.expectEqual(i, self.data[i]);
+            self.data[i] += i;
         }
     }
 
