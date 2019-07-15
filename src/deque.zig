@@ -7,41 +7,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Atomic = @import("deque/atomic.zig").Atomic;
+const Atomic = @import("atomic.zig").Atomic;
+const SegmentedList = std.SegmentedList;
+const Allocator = std.mem.Allocator;
 
-const mem = std.mem;
-
-const MIN_SIZE = 32;
-
-fn nextPowerOf2(x: usize) usize {
-    if (x == 0) return 1;
-    var result = x -% 1;
-    result = switch (@sizeOf(usize)) {
-        8 => result | (result >> 32),
-        4 => result | (result >> 16),
-        2 => result | (result >> 8),
-        1 => result | (result >> 4),
-        else => 0,
-    };
-    result |= (result >> 4);
-    result |= (result >> 2);
-    result |= (result >> 1);
-    return result +% (1 + @boolToInt(x <= 0));
-}
-
-pub fn Deque(comptime T: type) type {
+pub fn Deque(comptime T: type, comptime P: usize) type {
     return struct {
         const Self = @This();
+        const List = SegmentedList(T, P);
 
-        allocator: *mem.Allocator,
-        array: Atomic(*Buffer(T)),
+        allocator: *Allocator,
+        list: Atomic(*List),
         bottom: Atomic(isize),
         top: Atomic(isize),
 
-        pub fn new(allocator: *mem.Allocator) !Self {
-            const buf = try Buffer(T).new(allocator, MIN_SIZE);
+        pub fn new(allocator: *Allocator) !Self {
+            var list = try allocator.create(List);
+            list.* = List.init(allocator);
             return Self{
-                .array = Atomic(*Buffer(T)).init(buf),
+                .list = Atomic(*List).init(list),
                 .bottom = Atomic(isize).init(0),
                 .top = Atomic(isize).init(0),
                 .allocator = allocator,
@@ -49,33 +33,26 @@ pub fn Deque(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.array.load(.Monotonic).deinit();
+            self.list.load(.Monotonic).deinit();
         }
 
-        pub fn worker(self: *Self) Worker(T) {
-            return Worker(T){
+        pub fn worker(self: *Self) Worker(T, P) {
+            return Worker(T, P){
                 .deque = self,
             };
         }
 
-        pub fn stealer(self: *Self) Stealer(T) {
-            return Stealer(T){
+        pub fn stealer(self: *Self) Stealer(T, P) {
+            return Stealer(T, P){
                 .deque = self,
             };
         }
 
         fn push(self: *Self, item: T) !void {
             const bottom = self.bottom.load(.Monotonic);
-            const top = self.top.load(.Acquire);
-            var array = self.array.load(.Monotonic);
+            var list = self.list.load(.Monotonic);
 
-            const size = bottom -% top;
-            if (size == array.count()) {
-                array = try array.grow(bottom, top);
-                self.array.store(array, .Release);
-            }
-
-            array.put(bottom, item);
+            try list.push(item);
             @fence(.Release);
             self.bottom.store(bottom +% 1, .Monotonic);
         }
@@ -100,16 +77,16 @@ pub fn Deque(comptime T: type) type {
                 return null;
             }
 
-            const a = self.array.load(.Monotonic);
-            var data = a.get(bottom);
+            const list = self.list.load(.Monotonic);
+            var data = list.at(bottom);
 
             if (size != 0) {
-                return data;
+                return data.*;
             }
 
             if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
                 self.bottom.store(top +% 1, .Monotonic);
-                return data;
+                return data.*;
             } else {
                 self.bottom.store(top +% 1, .Monotonic);
                 return null;
@@ -126,23 +103,23 @@ pub fn Deque(comptime T: type) type {
                 return Stolen(T){ .Empty = {} };
             }
 
-            const a = self.array.load(.Acquire);
-            const data = a.get(top);
+            const list = self.list.load(.Acquire);
+            const data = list.at(@intCast(usize, top));
 
             if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
-                return Stolen(T){ .Data = data };
+                return Stolen(T){ .Data = data.* };
             } else {
-                return Stolen(T){ .Abort = {} };
+                return Stolen(T).Retry;
             }
         }
     };
 }
 
-pub fn Worker(comptime T: type) type {
+pub fn Worker(comptime T: type, comptime P: usize) type {
     return struct {
         const Self = @This();
 
-        deque: *Deque(T),
+        deque: *Deque(T, P),
 
         pub fn push(self: *const Self, item: T) !void {
             try self.deque.push(item);
@@ -154,11 +131,11 @@ pub fn Worker(comptime T: type) type {
     };
 }
 
-pub fn Stealer(comptime T: type) type {
+pub fn Stealer(comptime T: type, comptime P: usize) type {
     return struct {
         const Self = @This();
 
-        deque: *Deque(T),
+        deque: *Deque(T, P),
 
         pub fn steal(self: *const Self) Stolen(T) {
             return self.deque.steal();
@@ -169,83 +146,40 @@ pub fn Stealer(comptime T: type) type {
 pub fn Stolen(comptime T: type) type {
     return union(enum) {
         Empty: void,
-        Abort: void,
+        Retry: void,
         Data: T,
     };
 }
 
-fn Buffer(comptime T: type) type {
-    return struct {
-        const Self = @This();
+const Thread = std.Thread;
+const AMT: usize = 10000;
 
-        allocator: *mem.Allocator,
-        prev: ?*Buffer(T),
-        storage: []T,
-
-        fn new(allocator: *mem.Allocator, size: usize) !*Self {
-            var self = try allocator.createOne(Self);
-            self.storage = try allocator.alloc(T, size);
-            self.allocator = allocator;
-            self.prev = null;
-            return self;
-        }
-
-        fn deinit(self: *Self) void {
-            std.debug.warn("{}", self.storage.len);
-            self.allocator.free(self.storage);
-            if (self.prev) |buf| {
-                std.debug.warn(" + ");
-                buf.deinit();
-            } else {
-                std.debug.warn("\n");
+test "single thread" {
+    const S = struct {
+        fn task(stealer: Stealer(usize, 32)) void {
+            var left: usize = AMT;
+            while (left > 0) {
+                const stolen = stealer.steal();
+                switch (stolen) {
+                    Stolen(usize).Data => |i| {
+                        std.testing.expectEqual(i + left, AMT);
+                        left -= 1;
+                    },
+                    Stolen(usize).Empty => break,
+                    Stolen(usize).Retry => continue,
+                }
             }
-            self.allocator.destroy(self);
-        }
-
-        fn count(self: *const Self) isize {
-            return @intCast(isize, self.storage.len);
-        }
-
-        fn mask(self: *const Self) usize {
-            return @intCast(usize, self.storage.len -% 1);
-        }
-
-        fn elem(self: *const Self, i: isize) *T {
-            return &self.storage[@bitCast(usize, i) & self.mask()];
-        }
-
-        fn get(self: *const Self, i: isize) T {
-            return self.elem(i).*;
-        }
-
-        fn put(self: *const Self, i: isize, item: T) void {
-            self.elem(i).* = item;
-        }
-
-        fn grow(self: *Self, bottom: isize, top: isize) !*Self {
-            var buf = try Self.new(self.allocator, self.storage.len * 2);
-            var i = top;
-            while (i != bottom) : (i +%= 1) {
-                buf.put(i, self.get(i));
-            }
-            buf.prev = self;
-            return buf;
         }
     };
-}
 
-const AMT: usize = 10000;
-const AMT_size: usize = AMT * 2;
-var static_memory = []u8{0} ** (@sizeOf(usize) * AMT_size);
+    var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
+    var alloc = &fba.allocator;
 
-test "steal and push" {
-    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(static_memory[0..]);
-    var a = &fba.allocator;
-
-    var deque = try Deque(usize).new(a);
+    var deque = try Deque(usize, 32).new(alloc);
     defer deque.deinit();
 
-    const thread = try std.os.spawnThread(deque.stealer(), worker_stealpush);
+    const thread = try Thread.spawn(deque.stealer(), S.task);
 
     var i: usize = 0;
     const worker = deque.worker();
@@ -256,52 +190,54 @@ test "steal and push" {
     thread.wait();
 }
 
-fn worker_stealpush(stealer: Stealer(usize)) void {
-    var left: usize = AMT;
-    while (left > 0) {
-        switch (stealer.steal()) {
-            Stolen(usize).Data => |i| {
-                std.testing.expectEqual(i + left, AMT);
-                left -= 1;
-            },
-            Stolen(usize).Empty => break,
-            Stolen(usize).Abort => {},
+test "multiple threads" {
+    const S = struct {
+        const Self = @This();
+        stealer: Stealer(usize, 32),
+        data: [AMT]usize = [_]usize{0} ** AMT,
+
+        fn task(self: *Self) void {
+            while (true) {
+                switch (self.stealer.steal()) {
+                    Stolen(usize).Data => |i| {
+                        defer std.testing.expectEqual(i, self.data[i]);
+                        self.data[i] += i;
+                    },
+                    Stolen(usize).Empty => break,
+                    Stolen(usize).Retry => continue,
+                }
+            }
         }
+
+        fn verify(self: Self) void {
+            for (self.data[0..]) |*i, idx| {
+                std.testing.expectEqual(idx, i.*);
+            }
+        }
+    };
+
+    var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
+    var alloc = &fba.allocator;
+
+    var deque = try Deque(usize, 32).new(alloc);
+    defer deque.deinit();
+
+    var i: usize = 0;
+    const worker = deque.worker();
+    while (i < AMT) : (i += 1) {
+        try worker.push(i);
     }
+
+    var threads: [4]*std.Thread = undefined;
+    var ctx = S{
+        .stealer = deque.stealer(),
+    };
+
+    for (threads) |*t| {
+        t.* = try Thread.spawn(&ctx, S.task);
+    }
+
+    for (threads) |t| t.wait();
+    ctx.verify();
 }
-
-// test "multiple threads" {
-//     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(static_memory[0..]);
-//     var a = &fba.allocator;
-//     var deque = try Deque(usize).withCapacity(a, AMT);
-//     defer deque.deinit();
-//     var threads: [2]*std.os.Thread = undefined;
-//     for (threads) |*t| {
-//         t.* = try std.os.spawnThread(deque.stealer(), worker_multi);
-//     }
-//     var i: usize = 0;
-//     const worker = deque.worker();
-//     while (i < AMT) : (i += 1) {
-//         worker.push(i) catch |_| {
-//             std.debug.warn("\n{}\n", i);
-//             unreachable;
-//         };
-//     }
-//     for (threads) |t| {
-//         t.wait();
-//     }
-// }
-
-// fn worker_multi(stealer: Stealer(usize)) void {
-//     while (true) {
-//         switch (stealer.steal()) {
-//             Stolen(usize).Data => |i| {
-//                 // std.debug.warn("thread {}: {}\n", std.os.Thread.getCurrentId(), i);
-//             },
-//             Stolen(usize).Empty => {
-//                 break;
-//             },
-//             Stolen(usize).Abort => {},
-//         }
-//     }
-// }
