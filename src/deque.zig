@@ -93,23 +93,23 @@ pub fn Deque(comptime T: type, comptime P: usize) type {
             }
         }
 
-        pub fn steal(self: *Self) Stolen(T) {
-            const top = self.top.load(.Acquire);
-            @fence(.SeqCst);
-            const bottom = self.bottom.load(.Acquire);
+        pub fn steal(self: *Self) ?T {
+            while (true) {
+                const top = self.top.load(.Acquire);
+                @fence(.SeqCst);
+                const bottom = self.bottom.load(.Acquire);
 
-            const size = bottom -% top;
-            if (size <= 0) {
-                return Stolen(T){ .Empty = {} };
-            }
+                const size = bottom -% top;
+                if (size <= 0) return null;
 
-            const list = self.list.load(.Acquire);
-            const data = list.at(@intCast(usize, top));
+                const list = self.list.load(.Acquire);
+                const data = list.at(@intCast(usize, top));
 
-            if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
-                return Stolen(T){ .Data = data.* };
-            } else {
-                return Stolen(T).Retry;
+                if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
+                    return data.*;
+                } else {
+                    continue;
+                }
             }
         }
     };
@@ -137,17 +137,9 @@ pub fn Stealer(comptime T: type, comptime P: usize) type {
 
         deque: *Deque(T, P),
 
-        pub fn steal(self: *const Self) Stolen(T) {
+        pub fn steal(self: *const Self) ?T {
             return self.deque.steal();
         }
-    };
-}
-
-pub fn Stolen(comptime T: type) type {
-    return union(enum) {
-        Empty: void,
-        Retry: void,
-        Data: T,
     };
 }
 
@@ -158,17 +150,12 @@ test "single thread" {
     const S = struct {
         fn task(stealer: Stealer(usize, 32)) void {
             var left: usize = AMT;
-            while (left > 0) {
-                const stolen = stealer.steal();
-                switch (stolen) {
-                    Stolen(usize).Data => |i| {
-                        std.testing.expectEqual(i + left, AMT);
-                        left -= 1;
-                    },
-                    Stolen(usize).Empty => break,
-                    Stolen(usize).Retry => continue,
-                }
+            while (stealer.steal()) |i| {
+                std.testing.expectEqual(i + left, AMT);
+                std.testing.expectEqual(AMT - i, left);
+                left -= 1;
             }
+            std.testing.expectEqual(usize(0), left);
         }
     };
 
@@ -179,14 +166,13 @@ test "single thread" {
     var deque = try Deque(usize, 32).new(alloc);
     defer deque.deinit();
 
-    const thread = try Thread.spawn(deque.stealer(), S.task);
-
     var i: usize = 0;
     const worker = deque.worker();
     while (i < AMT) : (i += 1) {
         try worker.push(i);
     }
 
+    const thread = try Thread.spawn(deque.stealer(), S.task);
     thread.wait();
 }
 
@@ -197,15 +183,9 @@ test "multiple threads" {
         data: [AMT]usize = [_]usize{0} ** AMT,
 
         fn task(self: *Self) void {
-            while (true) {
-                switch (self.stealer.steal()) {
-                    Stolen(usize).Data => |i| {
-                        defer std.testing.expectEqual(i, self.data[i]);
-                        self.data[i] += i;
-                    },
-                    Stolen(usize).Empty => break,
-                    Stolen(usize).Retry => continue,
-                }
+            while (self.stealer.steal()) |i| {
+                defer std.testing.expectEqual(i, self.data[i]);
+                self.data[i] += i;
             }
         }
 
