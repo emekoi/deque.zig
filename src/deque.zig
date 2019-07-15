@@ -160,6 +160,7 @@ test "single-threaded" {
     };
 
     var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    defer std.heap.direct_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var alloc = &fba.allocator;
 
@@ -190,6 +191,7 @@ test "single-threaded-no-prealloc" {
     };
 
     var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    defer std.heap.direct_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var alloc = &fba.allocator;
 
@@ -227,6 +229,7 @@ test "multiple-threads" {
     };
 
     var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    defer std.heap.direct_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var alloc = &fba.allocator;
 
@@ -273,6 +276,7 @@ test "multiple-threads-no-prealloc" {
     };
 
     var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
+    defer std.heap.direct_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var alloc = &fba.allocator;
 
