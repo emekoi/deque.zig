@@ -11,29 +11,37 @@ const Atomic = @import("atomic.zig").Atomic;
 const SegmentedList = std.SegmentedList;
 const Allocator = std.mem.Allocator;
 
+pub fn Node(comptime T: type) type {
+    return struct {
+        data: T = undefined,
+        next: ?*Node(T) = null,
+    };
+}
+
 pub fn Deque(comptime T: type, comptime P: usize) type {
     return struct {
         const Self = @This();
-        const List = SegmentedList(T, P);
+        const List = SegmentedList(Node(T), P);
 
         allocator: *Allocator,
-        list: Atomic(*List),
-        bottom: Atomic(isize),
-        top: Atomic(isize),
+        storage: Atomic(*List),
+
+        free_list: Atomic(?*Node(T)),
+        in_use_list: Atomic(?*Node(T)),
 
         pub fn new(allocator: *Allocator) !Self {
-            var list = try allocator.create(List);
-            list.* = List.init(allocator);
+            var storage = try allocator.create(List);
+            storage.* = List.init(allocator);
             return Self{
-                .list = Atomic(*List).init(list),
-                .bottom = Atomic(isize).init(0),
-                .top = Atomic(isize).init(0),
+                .storage = Atomic(*List).init(storage),
+                .free_list = Atomic(?*Node(T)).init(null),
+                .in_use_list = Atomic(?*Node(T)).init(null),
                 .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.list.load(.Monotonic).deinit();
+            self.storage.load(.Monotonic).deinit();
         }
 
         pub fn worker(self: *Self) Worker(T, P) {
@@ -49,66 +57,81 @@ pub fn Deque(comptime T: type, comptime P: usize) type {
         }
 
         fn push(self: *Self, item: T) !void {
-            const bottom = self.bottom.load(.Monotonic);
-            var list = self.list.load(.Monotonic);
+            var in_use_list = self.in_use_list.load(.Monotonic);
+            var free_list = self.free_list.load(.Monotonic);
 
-            try list.push(item);
-            @fence(.Release);
-            self.bottom.store(bottom +% 1, .Monotonic);
+            if (free_list) |node| {
+                defer self.free_list.store(free_list, .Release);
+                defer self.in_use_list.store(in_use_list, .Release);
+
+                // remove from free list
+                free_list = node.next;
+                node.data = item;
+
+                // append to list of nodes in-use
+                in_use_list.?.next = node;
+                return;
+            }
+
+            defer self.in_use_list.store(in_use_list, .Release);
+
+            var storage = self.storage.load(.Monotonic);
+            var node = try storage.addOne();
+            node.data = item;
+
+            if (in_use_list) |list| {
+                list.next = node;
+            } else {
+                in_use_list = node;
+            }
         }
 
         fn pop(self: *Self) ?T {
-            var bottom = self.bottom.load(.Monotonic);
-            var top = self.top.load(.Monotonic);
+            var in_use_list = self.in_use_list.load(.Monotonic);
 
-            if (bottom -% top <= 0) {
-                return null;
-            }
+            if (in_use_list) |list| {
+                if (self.in_use_list.cmpSwapStrong(list, list.next, .SeqCst) == list) {
+                    var free_list = self.free_list.load(.Monotonic);
+                    defer self.free_list.store(free_list, .Release);
 
-            bottom -%= 1;
-            self.bottom.store(bottom, .Monotonic);
-            @fence(.SeqCst);
+                    const data = list.data;
 
-            top = self.top.load(.Monotonic);
+                    list.next = free_list;
+                    free_list = list;
 
-            const size = bottom -% top;
-            if (size < 0) {
-                self.bottom.store(bottom +% 1, .Monotonic);
-                return null;
-            }
-
-            const list = self.list.load(.Monotonic);
-            var data = list.at(bottom);
-
-            if (size != 0) {
-                return data.*;
-            }
-
-            if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
-                self.bottom.store(top +% 1, .Monotonic);
-                return data.*;
+                    return data;
+                } else {
+                    // value was stolen
+                    return null;
+                }
             } else {
-                self.bottom.store(top +% 1, .Monotonic);
+                // list is empty
                 return null;
             }
         }
 
         pub fn steal(self: *Self) ?T {
             while (true) {
-                const top = self.top.load(.Acquire);
-                @fence(.SeqCst);
-                const bottom = self.bottom.load(.Acquire);
+                var in_use_list = self.in_use_list.load(.Acquire);
 
-                const size = bottom -% top;
-                if (size <= 0) return null;
+                if (in_use_list) |list| {
+                    if (self.in_use_list.cmpSwapWeak(list, list.next, .SeqCst) == list) {
+                        var free_list = self.free_list.load(.Acquire);
+                        defer self.free_list.store(free_list, .Release);
 
-                const list = self.list.load(.Acquire);
-                const data = list.at(@intCast(usize, top));
+                        const data = list.data;
 
-                if (self.top.cmpSwap(top, top +% 1, .SeqCst) == top) {
-                    return data.*;
+                        list.next = free_list;
+                        free_list = list;
+
+                        return data;
+                    } else {
+                        // value was stolen
+                        continue;
+                    }
                 } else {
-                    continue;
+                    // list is empty
+                    return null;
                 }
             }
         }
@@ -151,8 +174,9 @@ test "single-threaded" {
         fn task(stealer: Stealer(usize, 32)) void {
             var left: usize = AMOUNT;
             while (stealer.steal()) |i| {
-                std.testing.expectEqual(i + left, AMOUNT);
-                std.testing.expectEqual(AMOUNT - i, left);
+                // std.testing.expectEqual(i + left, AMOUNT);
+                // std.testing.expectEqual(AMOUNT - i, left);
+                std.debug.warn("{}\n", i);
                 left -= 1;
             }
             std.testing.expectEqual(usize(0), left);
@@ -173,8 +197,17 @@ test "single-threaded" {
         try worker.push(i);
     }
 
-    const thread = try Thread.spawn(deque.stealer(), S.task);
-    thread.wait();
+    var p = deque.in_use_list.load(.Acquire);
+    std.debug.warn("hello\n");
+
+    while (p) |pointer| : (p = pointer.next) {
+        std.debug.warn("{}\n", pointer.data);
+    }
+
+    std.debug.warn("hello\n");
+
+    // const thread = try Thread.spawn(deque.stealer(), S.task);
+    // thread.wait();
 }
 
 test "single-threaded-no-prealloc" {

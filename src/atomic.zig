@@ -42,8 +42,16 @@ pub fn Atomic(comptime T: type) type {
             };
         }
 
-        pub fn cmpSwap(self: *Self, expected: T, new: T, comptime order: AtomicOrder) T {
+        pub fn cmpSwapStrong(self: *Self, expected: T, new: T, comptime order: AtomicOrder) T {
             if (@cmpxchgStrong(T, &self.raw, expected, new, order, comptime strongestFailureOrder(order))) |current| {
+                return current;
+            } else {
+                return expected;
+            }
+        }
+
+        pub fn cmpSwapWeak(self: *Self, expected: T, new: T, comptime order: AtomicOrder) T {
+            if (@cmpxchgWeak(T, &self.raw, expected, new, order, comptime strongestFailureOrder(order))) |current| {
                 return current;
             } else {
                 return expected;
