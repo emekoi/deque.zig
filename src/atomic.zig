@@ -1,4 +1,4 @@
-//  Copyright (c) 2018 emekoi
+//  Copyright (c) 2020 emekoi
 //
 //  This library is free software; you can redistribute it and/or modify it
 //  under the terms of the MIT license. See LICENSE for details.
@@ -24,7 +24,7 @@ pub fn Atomic(comptime T: type) type {
         }
 
         pub fn store(self: *Self, new: T, comptime order: AtomicOrder) void {
-            _ = self.xchg(new, order);
+            @atomicStore(T, &self.raw, new, order);
         }
 
         pub fn xchg(self: *Self, new: T, comptime order: AtomicOrder) T {

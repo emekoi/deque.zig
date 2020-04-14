@@ -2,8 +2,6 @@
 
 a lock free chase-lev deque for zig.
 
-
-
 ## usage
 ```zig
 const std = @import("std");
